@@ -26,7 +26,7 @@ from langchain_core.outputs import ChatGenerationChunk, GenerationChunk
 from langchain_core.runnables import RunnableConfig, ensure_config
 from langchain_core.tracers._streaming import _StreamingCallbackHandler
 from langchain_core.tracers.base import BaseTracer
-from langchain_core.tracers.memory_stream import _MemoryStream
+from langchain_core.tracers.memory_stream import _get_or_create_loop, _MemoryStream
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator, Sequence
@@ -229,7 +229,7 @@ class RunLog(RunLogPatch):
 T = TypeVar("T")
 
 
-class LogStreamCallbackHandler(BaseTracer, _StreamingCallbackHandler):
+class LogStreamCallbackHandler(BaseTracer, _StreamingCallbackHandler[Any]):
     """Tracer that streams run logs to a stream."""
 
     def __init__(
@@ -287,11 +287,7 @@ class LogStreamCallbackHandler(BaseTracer, _StreamingCallbackHandler):
         self.exclude_types = exclude_types
         self.exclude_tags = exclude_tags
 
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-        memory_stream = _MemoryStream[RunLogPatch](loop)
+        memory_stream = _MemoryStream[RunLogPatch](_get_or_create_loop(self))
         self.lock = threading.Lock()
         self.send_stream = memory_stream.get_send_stream()
         self.receive_stream = memory_stream.get_receive_stream()
@@ -537,7 +533,7 @@ class LogStreamCallbackHandler(BaseTracer, _StreamingCallbackHandler):
     def _on_llm_new_token(
         self,
         run: Run,
-        token: str,
+        token: str | list[str | dict[str, Any]],
         chunk: GenerationChunk | ChatGenerationChunk | None,
     ) -> None:
         """Process new LLM token."""
@@ -585,7 +581,7 @@ def _get_standardized_inputs(
         )
         raise NotImplementedError(msg)
 
-    inputs = load(run.inputs, allowed_objects="all")
+    inputs = load(run.inputs, allowed_objects="messages")
 
     if run.run_type in {"retriever", "llm", "chat_model"}:
         return inputs
@@ -617,7 +613,7 @@ def _get_standardized_outputs(
     Returns:
         An output if returned, otherwise `None`.
     """
-    outputs = load(run.outputs, allowed_objects="all")
+    outputs = load(run.outputs, allowed_objects="messages")
     if schema_format == "original":
         if run.run_type == "prompt" and "output" in outputs:
             # These were previously dumped before the tracer.
@@ -705,7 +701,7 @@ async def _astream_log_implementation(
         callbacks.add_handler(stream, inherit=True)
         config["callbacks"] = callbacks
     else:
-        msg = (
+        msg = (  # type: ignore[unreachable]
             f"Unexpected type for callbacks: {callbacks}."
             "Expected None, list or AsyncCallbackManager."
         )

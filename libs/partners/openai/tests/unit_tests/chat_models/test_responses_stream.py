@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
-from typing import Any
+import logging
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 from langchain_core.messages import AIMessageChunk, BaseMessageChunk
+from langchain_tests.utils.stream_lifecycle import assert_valid_event_stream
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseContentPartAddedEvent,
@@ -607,7 +609,9 @@ responses_stream = [
             truncation="disabled",
             usage=ResponseUsage(
                 input_tokens=13,
-                input_tokens_details=InputTokensDetails(cached_tokens=0),
+                input_tokens_details=InputTokensDetails(
+                    cache_write_tokens=0, cached_tokens=0
+                ),
                 output_tokens=71,
                 output_tokens_details=OutputTokensDetails(reasoning_tokens=64),
                 total_tokens=84,
@@ -760,6 +764,63 @@ def test_responses_stream(output_version: str, expected_content: list[dict]) -> 
         dumped = _strip_none(item.model_dump())
         _ = dumped.pop("status", None)
         assert dumped == payload["input"][idx]
+
+
+def test_responses_stream_events_v3_emits_reasoning_lifecycle() -> None:
+    """v3 streaming emits `content-block-finish` events for reasoning blocks.
+
+    Regression test: the protocol bridge should surface the full lifecycle
+    (`content-block-start` / `content-block-delta` / `content-block-finish`)
+    for every reasoning block observed on the wire, not just text blocks.
+    """
+    llm = ChatOpenAI(model="gpt-5-nano", use_responses_api=True, output_version="v1")
+    mock_client = MagicMock()
+
+    def mock_create(*args: Any, **kwargs: Any) -> MockSyncContextManager:
+        return MockSyncContextManager(responses_stream)
+
+    mock_client.responses.create = mock_create
+
+    with patch.object(llm, "root_client", mock_client):
+        events = list(llm.stream_events("test", version="v3"))
+
+    assert_valid_event_stream(events)
+
+    reasoning_starts = [
+        e
+        for e in events
+        if e["event"] == "content-block-start" and e["content"]["type"] == "reasoning"
+    ]
+    reasoning_finishes = [
+        e
+        for e in events
+        if e["event"] == "content-block-finish" and e["content"]["type"] == "reasoning"
+    ]
+
+    # The mock stream carries four reasoning summary parts (two per reasoning
+    # item, across two reasoning items), which surface as four reasoning
+    # content blocks in `output_version="v1"`.
+    assert len(reasoning_starts) == 4, (
+        f"expected 4 reasoning start events, got {len(reasoning_starts)}"
+    )
+    all_finish_types = [
+        e["content"]["type"] for e in events if e["event"] == "content-block-finish"
+    ]
+    assert len(reasoning_finishes) == 4, (
+        f"expected 4 reasoning finish events, got {len(reasoning_finishes)}: "
+        f"all finish events = {all_finish_types}"
+    )
+
+    # Finish events must carry the accumulated reasoning text.
+    reasoning_texts = [
+        cast("dict[str, Any]", f["content"])["reasoning"] for f in reasoning_finishes
+    ]
+    assert reasoning_texts == [
+        "reasoning block one",
+        "another reasoning block",
+        "more reasoning",
+        "still more reasoning",
+    ]
 
 
 def test_responses_stream_with_image_generation_multiple_calls() -> None:
@@ -946,7 +1007,9 @@ def test_responses_stream_function_call_preserves_namespace() -> None:
                 truncation="disabled",
                 usage=ResponseUsage(
                     input_tokens=10,
-                    input_tokens_details=InputTokensDetails(cached_tokens=0),
+                    input_tokens_details=InputTokensDetails(
+                        cache_write_tokens=0, cached_tokens=0
+                    ),
                     output_tokens=20,
                     output_tokens_details=OutputTokensDetails(reasoning_tokens=0),
                     total_tokens=30,
@@ -1020,15 +1083,15 @@ def test_responses_stream_tolerates_dict_response_field() -> None:
     ("event_index", "event_type"),
     [(0, ResponseCreatedEvent), (46, ResponseCompletedEvent)],
 )
-def test_responses_stream_normalizes_in_memory_prompt_cache_retention(
-    event_index: int, event_type: type
+def test_responses_stream_validates_in_memory_prompt_cache_retention(
+    event_index: int, event_type: type, caplog: pytest.LogCaptureFixture
 ) -> None:
     """`prompt_cache_retention="in_memory"` from the API must not abort streams.
 
-    The API emits the underscore form while older `openai` packages declare only
-    `"in-memory"` in the Literal (openai-python#2883). `_coerce_chunk_response`
-    should normalize so both the `response.created` and `response.completed`
-    handlers can validate successfully.
+    The OpenAI SDK accepts the underscore form, so both the `response.created`
+    and `response.completed` handlers should validate it via the strict
+    `Response.model_validate` path -- not the non-validating `model_construct`
+    fallback (which would also complete the stream, masking a regression).
     """
     stream = copy.deepcopy(responses_stream)
     target = stream[event_index]
@@ -1047,12 +1110,19 @@ def test_responses_stream_normalizes_in_memory_prompt_cache_retention(
     mock_client.responses.create = mock_create
 
     full: BaseMessageChunk | None = None
-    with patch.object(llm, "root_client", mock_client):
+    with (
+        caplog.at_level(logging.WARNING),
+        patch.object(llm, "root_client", mock_client),
+    ):
         for chunk in llm.stream("test"):
             assert isinstance(chunk, AIMessageChunk)
             full = chunk if full is None else full + chunk
     assert isinstance(full, AIMessageChunk)
     assert full.id == "resp_123"
+    # `in_memory` must validate cleanly: no fallback to the non-validating
+    # construct. Otherwise this test would pass even if the SDK rejected the
+    # value, giving false confidence in the removed normalization workaround.
+    assert "falling back to non-validating construct" not in caplog.text
     # The completed event drives usage/metadata aggregation, so assert it
     # survived coercion when that branch is exercised.
     if event_type is ResponseCompletedEvent:

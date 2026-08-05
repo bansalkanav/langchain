@@ -9,7 +9,9 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.errors import GraphInterrupt
 from pydantic import Field
+from typing_extensions import override
 
 from langchain.agents.factory import create_agent
 from langchain.agents.middleware._retry import calculate_delay
@@ -29,6 +31,7 @@ class TemporaryFailureModel(FakeToolCallingModel):
     fail_count: int = Field(default=0)
     attempt: int = Field(default=0)
 
+    @override
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -66,6 +69,7 @@ class AlwaysFailingModel(FakeToolCallingModel):
     error_message: str = Field(default="Model error")
     error_type: type[Exception] = Field(default=ValueError)
 
+    @override
     def _generate(
         self,
         messages: list[BaseMessage],
@@ -340,6 +344,7 @@ def test_model_retry_custom_exception_filter() -> None:
     class CustomErrorModel(FakeToolCallingModel):
         """Model that raises CustomError."""
 
+        @override
         def _generate(
             self,
             messages: list[BaseMessage],
@@ -396,6 +401,41 @@ def test_model_retry_custom_exception_filter() -> None:
     # Should retry once (attempt 1 with retry_me=True), then fail on attempt 2 (retry_me=False)
     assert attempt_count["value"] == 2
     assert "2 attempts" in ai_messages[-1].content
+
+
+def test_model_retry_reraises_graph_bubble_up() -> None:
+    """Graph control-flow signals propagate without retrying."""
+    retry = ModelRetryMiddleware(max_retries=3, initial_delay=0, jitter=False)
+    calls = 0
+    request = ModelRequest(model=FakeToolCallingModel(), messages=[])
+
+    def handler(_request: ModelRequest) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise GraphInterrupt
+
+    with pytest.raises(GraphInterrupt):
+        retry.wrap_model_call(request, handler)
+
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_model_retry_async_reraises_graph_bubble_up() -> None:
+    """Async graph control-flow signals propagate without retrying."""
+    retry = ModelRetryMiddleware(max_retries=3, initial_delay=0, jitter=False)
+    calls = 0
+    request = ModelRequest(model=FakeToolCallingModel(), messages=[])
+
+    async def handler(_request: ModelRequest) -> ModelResponse:
+        nonlocal calls
+        calls += 1
+        raise GraphInterrupt
+
+    with pytest.raises(GraphInterrupt):
+        await retry.awrap_model_call(request, handler)
+
+    assert calls == 1
 
 
 def test_model_retry_backoff_timing() -> None:

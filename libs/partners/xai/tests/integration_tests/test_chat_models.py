@@ -97,15 +97,37 @@ def test_reasoning(output_version: Literal["", "v1"]) -> None:
     assert followup_2.additional_kwargs["reasoning_content"]
 
 
+def test_reasoning_effort_call_time_kwarg() -> None:
+    """Test that `reasoning_effort` is accepted as a call-time kwarg."""
+    chat_model = ChatXAI(model="grok-3-mini", temperature=0)
+
+    response = chat_model.invoke("What is 3^3?", reasoning_effort="low")
+
+    assert response.content
+    assert response.additional_kwargs["reasoning_content"]
+    assert response.usage_metadata is not None
+
+
 def test_web_search() -> None:
     llm = ChatXAI(model=MODEL_NAME, temperature=0).bind_tools([{"type": "web_search"}])
+
+    # xAI may emit additional block types (e.g. `citation`, `reasoning`) alongside
+    # the core set, so assert each required type is present individually rather
+    # than checking set equality.
+    expected_types = ("server_tool_call", "server_tool_result", "text")
+
+    def _assert_web_search_block(blocks: list) -> None:
+        server_tool_calls = [b for b in blocks if b["type"] == "server_tool_call"]
+        assert server_tool_calls, "expected at least one server_tool_call block"
+        assert server_tool_calls[0]["name"] == "web_search"
 
     # Test invoke
     response = llm.invoke("Look up the current time in Boston, MA.")
     assert response.content
     content_types = {block["type"] for block in response.content_blocks}
-    assert content_types == {"server_tool_call", "server_tool_result", "text"}
-    assert response.content_blocks[0]["name"] == "web_search"  # type: ignore[typeddict-item]
+    for expected in expected_types:
+        assert expected in content_types, f"missing {expected!r} in {content_types}"
+    _assert_web_search_block(response.content_blocks)
 
     # Test streaming
     full: AIMessageChunk | None = None
@@ -114,5 +136,6 @@ def test_web_search() -> None:
         full = chunk if full is None else full + chunk
     assert isinstance(full, AIMessageChunk)
     content_types = {block["type"] for block in full.content_blocks}
-    assert content_types == {"server_tool_call", "server_tool_result", "text"}
-    assert full.content_blocks[0]["name"] == "web_search"  # type: ignore[typeddict-item]
+    for expected in expected_types:
+        assert expected in content_types, f"missing {expected!r} in {content_types}"
+    _assert_web_search_block(full.content_blocks)
